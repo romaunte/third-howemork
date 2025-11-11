@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Use hashcat to attack salted phone hashes from the provided XLSX dataset."""
-
+# -*- coding: utf-8 -*-
+"""
+GUI-инструмент лабораторной: восстановление телефонов из хэшей через hashcat.
+- Читает XLSX (A=hash, C=phone для валидации на нескольких строках)
+- Выбор алгоритма (MD5/SHA1/SHA256/SHA512), типа соли (цифры/буквы/смешанная), длины соли, паттерна (salt+phone/phone+salt/phone)
+- Запускает hashcat, сначала валидирует на известных парах (C), затем брутит весь столбец A
+- Сохраняет CSV с восстановленными телефонами (столбец C заменяется на найденные значения)
+- Исправлено ограничение "работает только из папки hashcat": hashcat запускается с cwd=его каталогу и PATH дополняется
+"""
 from __future__ import annotations
 
 import argparse
 import itertools
+import random
 import shutil
 import string
 import subprocess
@@ -15,23 +23,31 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+# --- GUI (tkinter)
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except Exception:
+    tk = None  # если нет GUI-окружения
+
 NAMESPACE = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
-
-# ---------------------------------------------------------------------------
-# XLSX parsing helpers (minimal replacement for openpyxl)
-# ---------------------------------------------------------------------------
+# ---------------- XLSX minimal reader ----------------
+def _fromstring(data: bytes):
+    from xml.etree import ElementTree as ET
+    return ET.fromstring(data)
 
 def iter_rows(path: Path) -> Iterator[Dict[str, str]]:
-    """Yield rows from the first worksheet of an XLSX file."""
-
     with zipfile.ZipFile(path) as zf:
         shared_strings = []
-        shared_xml = zf.read("xl/sharedStrings.xml")
-        root = _fromstring(shared_xml)
-        for si in root:
-            t = si.find(f".//{NAMESPACE}t")
-            shared_strings.append(t.text if t is not None else "")
+        try:
+            shared_xml = zf.read("xl/sharedStrings.xml")
+            root = _fromstring(shared_xml)
+            for si in root:
+                t = si.find(f".//{NAMESPACE}t")
+                shared_strings.append(t.text if t is not None else "")
+        except KeyError:
+            shared_strings = []
 
         sheet = _fromstring(zf.read("xl/worksheets/sheet1.xml"))
         for row in sheet.findall(f".//{NAMESPACE}row"):
@@ -55,349 +71,408 @@ def iter_rows(path: Path) -> Iterator[Dict[str, str]]:
             if values:
                 yield values
 
-
-def _fromstring(data: bytes):
-    from xml.etree import ElementTree as ET
-
-    return ET.fromstring(data)
-
-
-# ---------------------------------------------------------------------------
-# CLI configuration structures
-# ---------------------------------------------------------------------------
-
-
+# -------------- salt search space --------------------
 @dataclass
 class SaltSearchSpace:
     description: str
     alphabet: Sequence[str]
     min_length: int
     max_length: int
-
     def generate(self) -> Iterable[str]:
         chars = list(self.alphabet)
         for length in range(self.min_length, self.max_length + 1):
             for combo in itertools.product(chars, repeat=length):
                 yield "".join(combo)
 
-
-SALT_SPACES: Dict[str, SaltSearchSpace] = {
-    "digits1-4": SaltSearchSpace("digits (1-4)", string.digits, 1, 4),
-    "lower1-4": SaltSearchSpace("lowercase letters (1-4)", string.ascii_lowercase, 1, 4),
-    "alnum1-3": SaltSearchSpace(
-        "alphanumeric (1-3)", string.ascii_lowercase + string.digits, 1, 3
-    ),
-    "printable1-2": SaltSearchSpace(
-        "printable subset (1-2)", string.digits + string.ascii_letters + "_-@#", 1, 2
-    ),
+ALPHABETS = {
+    "numeric": string.digits,
+    "alpha": string.ascii_lowercase,
+    "mixed": string.ascii_lowercase + string.digits,
 }
 
-PATTERN_TO_ATTACK_MODE = {
-    "phone": 3,  # mask attack: hashcat -a 3 hash.txt mask
-    "salt+phone": 6,  # hybrid wordlist + mask: hashcat -a 6 hash.txt salts mask
-    "phone+salt": 7,  # hybrid mask + wordlist: hashcat -a 7 hash.txt mask salts
-}
-
-
-@dataclass
-class KnownPair:
-    hash_value: str
-    phone: str
-
-
-# ---------------------------------------------------------------------------
-# Hashcat invocation helpers
-# ---------------------------------------------------------------------------
-
-
+# -------------- hashcat helpers ----------------------
 def ensure_hashcat(path: str) -> str:
+    p = Path(path)
+    if p.exists():
+        return str(p.resolve())
     resolved = shutil.which(path)
     if resolved is None:
         raise FileNotFoundError(
-            f"Unable to locate '{path}'. Ensure hashcat is installed and available in PATH."
+            f"Не найден '{path}'. Установите hashcat и добавьте в PATH, "
+            f"или укажите полный путь в поле 'Hashcat path'."
         )
     return resolved
 
+def _prepare_hashcat_cwd_and_env(hashcat_path: str) -> Tuple[str, Dict[str, str]]:
+    from os import environ
+    exe = Path(hashcat_path).resolve()
+    if not exe.exists():
+        raise FileNotFoundError(f"hashcat не найден по пути {hashcat_path}")
+    hc_dir = str(exe.parent)
+    env = dict(environ)
+    sep = ";" if sys.platform == "win32" else ":"
+    env["PATH"] = hc_dir + (sep + env.get("PATH", ""))  # как будто запустили из его папки
+    return hc_dir, env
 
-def write_hash_file(path: Path, hashes: Sequence[str]) -> None:
-    path.write_text("\n".join(hashes) + "\n", encoding="utf-8")
-
-
-def write_salt_file(path: Path, salts: Iterable[str]) -> int:
-    count = 0
-    with path.open("w", encoding="utf-8") as handle:
-        for salt in salts:
-            handle.write(f"{salt}\n")
-            count += 1
-    return count
-
+def write_lines(path: Path, lines: Iterable[str]) -> None:
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def parse_outfile(path: Path) -> Dict[str, str]:
     cracked: Dict[str, str] = {}
     if not path.exists():
         return cracked
     for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
         if ":" not in line:
             continue
-        hash_part, plain = line.split(":", 1)
-        cracked[hash_part.strip()] = plain.strip()
+        h, plain = line.split(":", 1)
+        cracked[h.strip()] = plain.strip()
     return cracked
 
+PATTERN_TO_ATTACK_MODE = {
+    "phone": 3,        # -a 3: mask only
+    "salt+phone": 6,   # -a 6: wordlist (salts) + mask
+    "phone+salt": 7,   # -a 7: mask + wordlist (salts)
+}
 
-def run_hashcat(
-    *,
-    hashcat: str,
-    hash_file: Path,
-    attack_mode: int,
-    hash_type: int,
-    mask: str,
-    salts_file: Optional[Path],
-    extra_args: Sequence[str],
-) -> Tuple[int, Dict[str, str], subprocess.CompletedProcess[str]]:
+HASH_NAME_TO_M = {
+    "MD5": 0,
+    "SHA1": 100,
+    "SHA256": 1400,
+    "SHA512": 1700,
+}
+
+def run_hashcat(*, hashcat: str, hash_type: int, attack_mode: int,
+                hash_file: Path, mask: str, salts_file: Optional[Path],
+                extra_args: Sequence[str]) -> Tuple[int, Dict[str, str], subprocess.CompletedProcess[str]]:
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        outfile = tmp_path / "hashcat.out"
-        potfile = tmp_path / "hashcat.pot"
+        tmp = Path(tmpdir)
+        outfile = tmp / "hashcat.out"
+        potfile = tmp / "hashcat.pot"
 
         cmd = [
             hashcat,
-            "-m",
-            str(hash_type),
-            "-a",
-            str(attack_mode),
-            "--potfile-path",
-            str(potfile),
-            "--outfile",
-            str(outfile),
-            "--outfile-format",
-            "2",  # hash:plain
+            "-m", str(hash_type),
+            "-a", str(attack_mode),
+            "--potfile-path", str(potfile),
+            "--outfile", str(outfile),
+            "--outfile-format", "2",   # hash:plain
             str(hash_file),
         ]
-
-        if attack_mode == 6:  # salt+phone
-            if salts_file is None:
-                raise ValueError("salt+phone pattern requires a salts file")
+        if attack_mode == 6:
+            if not salts_file:
+                raise ValueError("Для паттерна salt+phone нужен файл солей")
             cmd.append(str(salts_file))
             cmd.append(mask)
-        elif attack_mode == 7:  # phone+salt
-            if salts_file is None:
-                raise ValueError("phone+salt pattern requires a salts file")
+        elif attack_mode == 7:
+            if not salts_file:
+                raise ValueError("Для паттерна phone+salt нужен файл солей")
             cmd.append(mask)
             cmd.append(str(salts_file))
-        else:  # mask only
+        else:
             cmd.append(mask)
-
         cmd.extend(extra_args)
 
-        result = subprocess.run(
-            cmd,
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-
+        cwd, env = _prepare_hashcat_cwd_and_env(hashcat)
+        proc = subprocess.run(cmd, text=True, capture_output=True, check=False, cwd=cwd, env=env)
         cracked = parse_outfile(outfile)
-        return result.returncode, cracked, result
+        return proc.returncode, cracked, proc
 
-
-# ---------------------------------------------------------------------------
-# Business logic
-# ---------------------------------------------------------------------------
-
+# -------------- business logic -----------------------
+@dataclass
+class KnownPair:
+    hash_value: str
+    phone: str
 
 def load_known_pairs(rows: Iterable[Dict[str, str]], limit: int) -> List[KnownPair]:
     known: List[KnownPair] = []
-    for row in rows:
+    for r in rows:
         if len(known) >= limit:
             break
-        hash_value = row.get("A")
-        phone = row.get("C")
-        if hash_value and phone:
-            known.append(KnownPair(hash_value, phone))
+        h = r.get("A")
+        p = r.get("C")
+        if h and p:
+            known.append(KnownPair(h, p))
     return known
 
-
 def load_all_hashes(rows: Iterable[Dict[str, str]]) -> List[str]:
-    hashes: List[str] = []
-    for row in rows:
-        hash_value = row.get("A")
-        if hash_value:
-            hashes.append(hash_value)
-    return hashes
+    out: List[str] = []
+    for r in rows:
+        h = r.get("A")
+        if h:
+            out.append(h)
+    return out
 
+def col_letters_to_index(col: str) -> int:
+    idx = 0
+    for ch in col:
+        idx = idx * 26 + (ord(ch.upper()) - ord("A") + 1)
+    return idx
+
+def index_to_letters(i: int) -> str:
+    s = ""
+    x = i
+    while x:
+        x, rem = divmod(x - 1, 26)
+        s = chr(ord("A") + rem) + s
+    return s
+
+def max_col_in_rows(rows: List[Dict[str,str]]) -> int:
+    m = 0
+    for r in rows:
+        for k in r.keys():
+            try:
+                i = col_letters_to_index(k)
+                if i > m: m = i
+            except Exception:
+                pass
+    return m
+
+# -------------- GUI -----------------------
+class App:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        root.title("Hashcat деобезличивание (восстановление телефонов)")
+        root.geometry("760x520")
+        frm = ttk.Frame(root, padding=10); frm.pack(fill="both", expand=True)
+
+        # File
+        row = ttk.Frame(frm); row.pack(fill="x", pady=6)
+        ttk.Label(row, text="XLSX файл:").pack(side="left")
+        self.file_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.file_var, width=70).pack(side="left", padx=6)
+        ttk.Button(row, text="Обзор…", command=self.browse).pack(side="left")
+
+        # Hashcat path
+        row = ttk.Frame(frm); row.pack(fill="x", pady=6)
+        ttk.Label(row, text="Hashcat path:").pack(side="left")
+        self.hc_var = tk.StringVar(value="hashcat")  # можно указать полный путь к hashcat.exe
+        ttk.Entry(row, textvariable=self.hc_var, width=50).pack(side="left", padx=6)
+
+        # Algorithm / pattern / mask
+        row = ttk.Frame(frm); row.pack(fill="x", pady=6)
+        ttk.Label(row, text="Алгоритм:").pack(side="left")
+        self.alg_var = tk.StringVar(value="SHA256")
+        ttk.Combobox(row, textvariable=self.alg_var,
+                     values=["MD5","SHA1","SHA256","SHA512"], state="readonly", width=10).pack(side="left", padx=6)
+        ttk.Label(row, text="Паттерн:").pack(side="left", padx=(12,0))
+        self.pattern_var = tk.StringVar(value="salt+phone")
+        ttk.Combobox(row, textvariable=self.pattern_var,
+                     values=["salt+phone","phone+salt","phone"], state="readonly", width=12).pack(side="left", padx=6)
+        ttk.Label(row, text="Маска телефона:").pack(side="left", padx=(12,0))
+        self.mask_var = tk.StringVar(value="8?d?d?d?d?d?d?d?d?d?d")
+        ttk.Entry(row, textvariable=self.mask_var, width=28).pack(side="left", padx=6)
+
+        # Salt config
+        row = ttk.Frame(frm); row.pack(fill="x", pady=6)
+        ttk.Label(row, text="Тип соли:").pack(side="left")
+        self.salt_type_var = tk.StringVar(value="numeric")
+        ttk.Combobox(row, textvariable=self.salt_type_var,
+                     values=["numeric","alpha","mixed"], state="readonly", width=10).pack(side="left", padx=6)
+        ttk.Label(row, text="Длина соли (min-max):").pack(side="left", padx=(12,0))
+        self.salt_min = tk.IntVar(value=1)
+        self.salt_max = tk.IntVar(value=4)
+        ttk.Spinbox(row, from_=0, to=8, textvariable=self.salt_min, width=4).pack(side="left", padx=3)
+        ttk.Spinbox(row, from_=0, to=8, textvariable=self.salt_max, width=4).pack(side="left", padx=3)
+        ttk.Label(row, text="Кол-во известных пар (валидация):").pack(side="left", padx=(12,0))
+        self.known_n = tk.IntVar(value=5)
+        ttk.Spinbox(row, from_=1, to=50, textvariable=self.known_n, width=5).pack(side="left", padx=3)
+
+        # Extra args
+        row = ttk.Frame(frm); row.pack(fill="x", pady=6)
+        ttk.Label(row, text="Доп. аргументы hashcat (необязательно):").pack(side="left")
+        self.extra_args = tk.StringVar(value="--force")
+        ttk.Entry(row, textvariable=self.extra_args, width=50).pack(side="left", padx=6)
+
+        # Buttons
+        row = ttk.Frame(frm); row.pack(fill="x", pady=10)
+        ttk.Button(row, text="Восстановить телефоны (hashcat)", command=self.run_crack).pack(side="left", padx=6)
+        ttk.Button(row, text="Выход", command=root.destroy).pack(side="right", padx=6)
+
+        # Log
+        row = ttk.Frame(frm); row.pack(fill="both", expand=True)
+        ttk.Label(row, text="Лог:").pack(anchor="w")
+        self.log = tk.Text(row, height=14, wrap="word"); self.log.pack(fill="both", expand=True)
+
+    def log_print(self, *parts):
+        self.log.insert("end", " ".join(str(p) for p in parts) + "\n")
+        self.log.see("end")
+
+    def browse(self):
+        p = filedialog.askopenfilename(filetypes=[("Excel files","*.xlsx")])
+        if p: self.file_var.set(p)
+
+    def run_crack(self):
+        xlsx = self.file_var.get().strip()
+        if not xlsx:
+            messagebox.showerror("Ошибка", "Выберите XLSX файл.")
+            return
+        try:
+            rows = list(iter_rows(Path(xlsx)))
+        except Exception as e:
+            messagebox.showerror("Ошибка чтения XLSX", str(e))
+            return
+        if not rows:
+            messagebox.showerror("Ошибка", "В книге не найдено строк.")
+            return
+
+        alg = self.alg_var.get()
+        m = HASH_NAME_TO_M[alg]
+        pattern = self.pattern_var.get()
+        a_mode = PATTERN_TO_ATTACK_MODE[pattern]
+        mask = self.mask_var.get().strip() or "8?d?d?d?d?d?d?d?d?d?d"
+        salt_type = self.salt_type_var.get()
+        min_len, max_len = int(self.salt_min.get()), int(self.salt_max.get())
+        if max_len < min_len:
+            messagebox.showerror("Ошибка", "Длина соли: max < min")
+            return
+
+        # выбрать путь к hashcat
+        try:
+            hashcat_path = ensure_hashcat(self.hc_var.get().strip() or "hashcat")
+        except Exception as e:
+            messagebox.showerror("Hashcat", str(e)); return
+
+        # подготовка данных
+        known = load_known_pairs(rows, self.known_n.get())
+        if not known:
+            messagebox.showerror("Ошибка", "Не удалось найти известные пары (колонка C должна содержать телефоны хотя бы в нескольких строках).")
+            return
+        all_hashes = load_all_hashes(rows)
+        if not all_hashes:
+            messagebox.showerror("Ошибка", "Не найдены значения хэшей в колонке A.")
+            return
+
+        # генерируем соли
+        salts: List[str] = []
+        if pattern != "phone":
+            alphabet = ALPHABETS[salt_type]
+            space = SaltSearchSpace(f"{salt_type}({min_len}-{max_len})", alphabet, min_len, max_len)
+            # ВНИМАНИЕ: количество комбинаций растёт экспоненциально.
+            # Для лабораторных типичные min/max малы (1-4).
+            salts = list(space.generate())
+            salts = sorted(set(salts))
+            if not salts:
+                messagebox.showerror("Ошибка", "Не сгенерировались значения соли.")
+                return
+
+        self.log_print(f"Найдено известных пар: {len(known)}; всего хэшей: {len(all_hashes)}; солей: {len(salts)}")
+        out_csv = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")], title="Сохранить результат как")
+        if not out_csv:
+            return
+
+        # временные файлы
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            known_hashes = tmp / "known.hashes"
+            all_hashes_file = tmp / "all.hashes"
+            salts_file = tmp / "salts.txt"
+
+            write_lines(known_hashes, [kp.hash_value for kp in known])
+            write_lines(all_hashes_file, all_hashes)
+            if pattern != "phone":
+                write_lines(salts_file, salts)
+
+            extra = self.extra_args.get().strip().split() if self.extra_args.get().strip() else []
+
+            # 1) Валидация на известных парах
+            self.log_print(f"Валидация на известных парах: m={m}, a={a_mode}, pattern={pattern}")
+            code, cracked_known, proc = run_hashcat(
+                hashcat=hashcat_path,
+                hash_type=m,
+                attack_mode=a_mode,
+                hash_file=known_hashes,
+                mask=mask,
+                salts_file=salts_file if pattern!="phone" else None,
+                extra_args=extra,
+            )
+            # показать вывод
+            if proc.stdout: self.log_print(proc.stdout)
+            if proc.stderr: self.log_print(proc.stderr)
+
+            if len(cracked_known) < len(known):
+                self.log_print(f"Не все известные пары восстановлены ({len(cracked_known)}/{len(known)}). Останавливаюсь.")
+                messagebox.showwarning("Валидация не пройдена",
+                                       f"Восстановлено {len(cracked_known)} из {len(known)} известных телефонов. "
+                                       f"Уточните маску/соль/алгоритм.")
+                return
+            self.log_print("Валидация пройдена. Запускаю на всём наборе…")
+
+            # 2) Полный набор
+            code, cracked_all, proc2 = run_hashcat(
+                hashcat=hashcat_path,
+                hash_type=m,
+                attack_mode=a_mode,
+                hash_file=all_hashes_file,
+                mask=mask,
+                salts_file=salts_file if pattern!="phone" else None,
+                extra_args=extra,
+            )
+            if proc2.stdout: self.log_print(proc2.stdout)
+            if proc2.stderr: self.log_print(proc2.stderr)
+
+        # собрать CSV: те же колонки, но колонку C заполняем восстановленными телефонами
+        max_col = max_col_in_rows(rows)
+        # строим заголовки A..N
+        headers = [index_to_letters(i) for i in range(1, max_col+1)]
+        # Если хотим явно обозначить, что C — восстановлена:
+        # заменим имя C на C_RECOVERED
+        headers = [("C_RECOVERED" if h == "C" else h) for h in headers]
+
+        recovered_count = 0
+        import csv
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for r in rows:
+                row_out = []
+                h = r.get("A")
+                phone = None
+                if h and h in cracked_all:
+                    phone = cracked_all[h]
+                    recovered_count += 1
+                for i in range(1, max_col+1):
+                    col = index_to_letters(i)
+                    if col == "C":
+                        row_out.append(phone if phone is not None else "UNKNOWN")
+                    else:
+                        row_out.append(r.get(col, ""))
+                w.writerow(row_out)
+
+        self.log_print(f"Готово. Восстановлено {recovered_count} из {len(all_hashes)}. Результат: {out_csv}")
+        messagebox.showinfo("Готово", f"Восстановлено {recovered_count} из {len(all_hashes)} телефонов.\nФайл: {out_csv}")
+
+# -------------- entrypoints -----------------
+def run_gui() -> int:
+    if tk is None:
+        print("Tkinter недоступен в этой среде.")
+        return 1
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+    return 0
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("xlsx", type=Path, help="Path to the XLSX dataset")
-    parser.add_argument(
-        "--hashcat",
-        default="hashcat",
-        help="Path to the hashcat binary (default: hashcat in PATH)",
-    )
-    parser.add_argument(
-        "--hash-type",
-        type=int,
-        action="append",
-        required=True,
-        help="Hashcat hash-type identifier to test (can be repeated)",
-    )
-    parser.add_argument(
-        "--pattern",
-        choices=sorted(PATTERN_TO_ATTACK_MODE),
-        default="salt+phone",
-        help="How the salt is combined with the phone number",
-    )
-    parser.add_argument(
-        "--salt-space",
-        choices=sorted(SALT_SPACES),
-        action="append",
-        default=["digits1-4"],
-        help="Named salt search spaces to combine (repeat for more spaces)",
-    )
-    parser.add_argument(
-        "--mask",
-        default="8?d?d?d?d?d?d?d?d?d?d",
-        help="Hashcat mask describing the phone format",
-    )
-    parser.add_argument(
-        "--limit-known",
-        type=int,
-        default=5,
-        help="Number of known pairs from column C to validate against",
-    )
-    parser.add_argument(
-        "--extra-arg",
-        action="append",
-        default=[],
-        help="Extra arguments to append to the hashcat command (repeatable)",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Where to write cracked results (default: alongside the XLSX file)",
-    )
+    # Если запускают с аргументами — дадим простой тест hashcat; без аргументов — GUI
+    parser = argparse.ArgumentParser(description="GUI для hashcat-восстановления телефонов из XLSX")
+    parser.add_argument("--hashcat", default=None, help="Путь к hashcat (по умолчанию ищется в PATH)")
+    parser.add_argument("--test-hashcat", action="store_true", help="Запустить 'hashcat --help' из любой папки (проверка окружения)")
     args = parser.parse_args(argv)
 
-    try:
-        hashcat_path = ensure_hashcat(args.hashcat)
-    except FileNotFoundError as exc:
-        print(exc)
-        return 127
-
-    rows = list(iter_rows(args.xlsx))
-    if not rows:
-        print("No rows found in the workbook.")
-        return 1
-
-    known_pairs = load_known_pairs(rows, args.limit_known)
-    if not known_pairs:
-        print("Unable to locate known plaintext samples in column C.")
-        return 1
-
-    all_hashes = load_all_hashes(rows)
-    if not all_hashes:
-        print("No hash values discovered in column A.")
-        return 1
-
-    salts: List[str] = []
-    for space_name in args.salt_space:
-        space = SALT_SPACES[space_name]
-        salts.extend(space.generate())
-    salts = sorted(set(salts))
-
-    if args.pattern != "phone" and not salts:
-        print("Salted patterns require at least one salt candidate.")
-        return 1
-
-    if args.output is None:
-        args.output = args.xlsx.with_suffix(".hashcat.txt")
-
-    print(f"Loaded {len(known_pairs)} known pairs for validation.")
-    print(f"Discovered {len(all_hashes)} hashed entries in the dataset.")
-    print(
-        f"Generated {len(salts)} candidate salts across {len(args.salt_space)} search spaces."
-    )
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        known_hash_file = tmp / "known.hashes"
-        all_hash_file = tmp / "all.hashes"
-        salts_file = tmp / "salts.txt"
-
-        write_hash_file(known_hash_file, [kp.hash_value for kp in known_pairs])
-        write_hash_file(all_hash_file, all_hashes)
-        if args.pattern != "phone":
-            count = write_salt_file(salts_file, salts)
-            if count == 0:
-                print("Salted pattern selected but no salts produced.")
-                return 1
-
-        for hash_type in args.hash_type:
-            attack_mode = PATTERN_TO_ATTACK_MODE[args.pattern]
-            print(
-                f"\nRunning hashcat (m={hash_type}, a={attack_mode}, pattern={args.pattern}) "
-                f"against {known_hash_file.name} to validate salt candidates..."
-            )
-
-            exit_code, cracked_known, process = run_hashcat(
-                hashcat=hashcat_path,
-                hash_file=known_hash_file,
-                attack_mode=attack_mode,
-                hash_type=hash_type,
-                mask=args.mask,
-                salts_file=salts_file if args.pattern != "phone" else None,
-                extra_args=args.extra_arg,
-            )
-
-            sys.stdout.write(process.stdout)
-            sys.stderr.write(process.stderr)
-
-            if len(cracked_known) < len(known_pairs):
-                print(
-                    f"Failed to crack all {len(known_pairs)} known samples (cracked {len(cracked_known)})."
-                )
-                continue
-
-            print(
-                f"Validation succeeded with hash-type {hash_type}; cracking full dataset next..."
-            )
-
-            exit_code, cracked_all, process = run_hashcat(
-                hashcat=hashcat_path,
-                hash_file=all_hash_file,
-                attack_mode=attack_mode,
-                hash_type=hash_type,
-                mask=args.mask,
-                salts_file=salts_file if args.pattern != "phone" else None,
-                extra_args=args.extra_arg,
-            )
-
-            sys.stdout.write(process.stdout)
-            sys.stderr.write(process.stderr)
-
-            if not cracked_all:
-                print("Hashcat did not recover any entries from the full dataset.")
-                continue
-
-            print(
-                f"Hashcat recovered {len(cracked_all)} of {len(all_hashes)} entries. "
-                f"Writing results to {args.output}."
-            )
-
-            with args.output.open("w", encoding="utf-8") as handle:
-                for hash_value in all_hashes:
-                    phone = cracked_all.get(hash_value, "UNKNOWN")
-                    handle.write(f"{hash_value}\t{phone}\n")
-
-            print("Done.")
-            return 0
-
-    print("Hashcat was unable to crack the dataset with the provided parameters.")
-    return 2
-
+    if args.test_hashcat:
+        path = args.hashcat or "hashcat"
+        try:
+            hc = ensure_hashcat(path)
+            cwd, env = _prepare_hashcat_cwd_and_env(hc)
+            proc = subprocess.run([hc, "--help"], text=True, capture_output=True, cwd=cwd, env=env)
+            print(proc.stdout[:1200])
+            if proc.returncode != 0:
+                print(proc.stderr)
+            return proc.returncode
+        except Exception as e:
+            print("Ошибка проверки hashcat:", e)
+            return 2
+    else:
+        return run_gui()
 
 if __name__ == "__main__":
     sys.exit(main())
