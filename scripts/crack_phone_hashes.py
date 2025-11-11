@@ -21,7 +21,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 # --- GUI (tkinter)
 try:
@@ -78,11 +78,22 @@ class SaltSearchSpace:
     alphabet: Sequence[str]
     min_length: int
     max_length: int
+
     def generate(self) -> Iterable[str]:
         chars = list(self.alphabet)
         for length in range(self.min_length, self.max_length + 1):
             for combo in itertools.product(chars, repeat=length):
                 yield "".join(combo)
+
+    def count(self) -> int:
+        chars = len(self.alphabet)
+        total = 0
+        for length in range(self.min_length, self.max_length + 1):
+            if length == 0:
+                total += 1
+            else:
+                total += chars ** length
+        return total
 
 ALPHABETS = {
     "numeric": string.digits,
@@ -92,6 +103,8 @@ ALPHABETS = {
 
 # -------------- hashcat helpers ----------------------
 DEFAULT_HASHCAT_PATH = r"C:\\Program Files\\hashcat-7.1.2"
+MAX_AUTO_SALT_LENGTH = 10
+AUTO_SALT_COMBO_LIMIT = 1_000_000
 
 
 def ensure_hashcat(path: str) -> str:
@@ -124,7 +137,9 @@ def _prepare_hashcat_cwd_and_env(hashcat_path: str) -> Tuple[str, Dict[str, str]
     return hc_dir, env
 
 def write_lines(path: Path, lines: Iterable[str]) -> None:
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with path.open("w", encoding="utf-8") as fh:
+        for line in lines:
+            fh.write(f"{line}\n")
 
 def parse_outfile(path: Path) -> Dict[str, str]:
     cracked: Dict[str, str] = {}
@@ -428,7 +443,8 @@ class App:
             return
 
         # генерируем соли
-        salts: List[str] = []
+        salt_space: Optional[SaltSearchSpace] = None
+        salt_count = 0
         if pattern != "phone":
             alphabet = ALPHABETS[salt_type]
             try:
@@ -444,6 +460,8 @@ class App:
             if not salts:
                 messagebox.showerror("Ошибка", "Не сгенерировались значения соли.")
                 return
+            salt_space = SaltSearchSpace(f"{salt_type}(len={detected_length})", alphabet, detected_length, detected_length)
+            salt_count = salt_space.count()
 
         self.log_print(f"Найдено известных пар: {len(known)}; всего хэшей: {len(all_hashes)}; солей: {len(salts)}")
         if pattern != "phone":
