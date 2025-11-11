@@ -275,58 +275,66 @@ def _hash_function(name: str):
     return mapping[name]
 
 
-def detect_salt_length_via_hashcat(*,
-                                   known_pairs: Sequence[KnownPair],
-                                   alphabet: Sequence[str],
-                                   hashcat_path: str,
-                                   hash_type: int,
-                                   attack_mode: int,
-                                   pattern: str,
-                                   log: Optional[Callable[..., None]] = None) -> int:
-    if not known_pairs:
+def _max_auto_length(alphabet_size: int, limit: int = 1_000_000) -> int:
+    if alphabet_size <= 1:
+        return 8
+
+    length = 0
+    combos = 1
+    while combos <= limit:
+        length += 1
+        combos *= alphabet_size
+        if combos > limit:
+            return length - 1
+    return length
+
+
+def _detect_salt_length_for_pair(pair: KnownPair, *, hash_name: str, pattern: str,
+                                 alphabet: Sequence[str], max_length: int) -> Optional[int]:
+    hfunc = _hash_function(hash_name)
+    phone = pair.phone
+    target = pair.hash_value.lower()
+
+    if pattern == "phone":
+        digest = hfunc(phone.encode("utf-8")).hexdigest()
+        return 0 if digest == target else None
+
+    for length in range(0, max_length + 1):
+        for salt_tuple in itertools.product(alphabet, repeat=length):
+            salt = "".join(salt_tuple)
+            if pattern == "salt+phone":
+                data = (salt + phone).encode("utf-8")
+            else:  # phone+salt
+                data = (phone + salt).encode("utf-8")
+            digest = hfunc(data).hexdigest()
+            if digest == target:
+                return length
+    return None
+
+
+def detect_salt_length_range(known: Sequence[KnownPair], *, hash_name: str,
+                             pattern: str, alphabet: Sequence[str]) -> Tuple[int, int]:
+    if pattern == "phone":
+        return 0, 0
+    if not known:
         raise ValueError("Нет известных пар для определения длины соли")
 
-    def emit(*parts: object) -> None:
-        if log is not None:
-            log(*parts)
+    max_length = _max_auto_length(len(alphabet))
+    if max_length == 0:
+        raise ValueError("Слишком большой алфавит для автоматического перебора длины соли")
 
-    alphabet_seq = list(alphabet)
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        known_hashes = tmp / "known.hashes"
-        write_lines(known_hashes, [kp.hash_value for kp in known_pairs])
+    first_pair = known[0]
+    length = _detect_salt_length_for_pair(
+        first_pair,
+        hash_name=hash_name,
+        pattern=pattern,
+        alphabet=alphabet,
+        max_length=max_length,
+    )
+    if length is None:
+        raise ValueError("Не удалось определить длину соли по известной паре")
 
-        for length in range(0, MAX_AUTO_SALT_LENGTH + 1):
-            space = SaltSearchSpace(f"len={length}", alphabet_seq, length, length)
-            combo_count = space.count()
-            if combo_count == 0:
-                continue
-            if combo_count > AUTO_SALT_COMBO_LIMIT:
-                emit(f"Пропускаю длину соли {length}: комбинаций {combo_count} > {AUTO_SALT_COMBO_LIMIT}")
-                continue
-
-            emit(f"Пробую определить длину соли {length} (комбинаций: {combo_count})…")
-            salts_file = tmp / "salts.txt"
-            write_lines(salts_file, space.generate())
-            _code, cracked, proc = run_hashcat(
-                hashcat=hashcat_path,
-                hash_type=hash_type,
-                attack_mode=attack_mode,
-                hash_file=known_hashes,
-                mask=DEFAULT_PHONE_MASK,
-                salts_file=salts_file if pattern != "phone" else None,
-                extra_args=(),
-            )
-            if proc.stdout:
-                emit(proc.stdout)
-            if proc.stderr:
-                emit(proc.stderr)
-            if len(cracked) == len(known_pairs):
-                emit(f"hashcat восстановил все известные пары при длине соли {length}.")
-                return length
-            emit(f"Длина {length} не подошла (восстановлено {len(cracked)} из {len(known_pairs)}).")
-
-    raise ValueError("Не удалось автоматически определить длину соли в диапазоне 0-10.")
+    return length, length
 
 
 def hash_phone_value(phone: str, *, salt: str, pattern: str, hash_name: str) -> str:
@@ -440,24 +448,24 @@ class App:
         if pattern != "phone":
             alphabet = ALPHABETS[salt_type]
             try:
-                detected_length = detect_salt_length_via_hashcat(
-                    known_pairs=known,
-                    alphabet=alphabet,
-                    hashcat_path=hashcat_path,
-                    hash_type=m,
-                    attack_mode=a_mode,
-                    pattern=pattern,
-                    log=self.log_print,
-                )
+                min_len, max_len = detect_salt_length_range(known, hash_name=alg, pattern=pattern, alphabet=alphabet)
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Не удалось определить длину соли автоматически: {e}")
+                return
+            space = SaltSearchSpace(f"{salt_type}({min_len}-{max_len})", alphabet, min_len, max_len)
+            # ВНИМАНИЕ: количество комбинаций растёт экспоненциально.
+            # Для лабораторных типичные min/max малы (1-4).
+            salts = list(space.generate())
+            salts = sorted(set(salts))
+            if not salts:
+                messagebox.showerror("Ошибка", "Не сгенерировались значения соли.")
                 return
             salt_space = SaltSearchSpace(f"{salt_type}(len={detected_length})", alphabet, detected_length, detected_length)
             salt_count = salt_space.count()
 
-        self.log_print(f"Найдено известных пар: {len(known)}; всего хэшей: {len(all_hashes)}; солей: {salt_count}")
-        if salt_space is not None:
-            self.log_print(f"Длина соли (авто): {salt_space.min_length}")
+        self.log_print(f"Найдено известных пар: {len(known)}; всего хэшей: {len(all_hashes)}; солей: {len(salts)}")
+        if pattern != "phone":
+            self.log_print(f"Длины соли (авто): {min_len}-{max_len}")
         out_csv = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")], title="Сохранить результат как")
         if not out_csv:
             return
@@ -471,8 +479,8 @@ class App:
 
             write_lines(known_hashes, [kp.hash_value for kp in known])
             write_lines(all_hashes_file, all_hashes)
-            if salt_space is not None:
-                write_lines(salts_file, salt_space.generate())
+            if pattern != "phone":
+                write_lines(salts_file, salts)
 
             # 1) Валидация на известных парах
             self.log_print(f"Валидация на известных парах: m={m}, a={a_mode}, pattern={pattern}")
