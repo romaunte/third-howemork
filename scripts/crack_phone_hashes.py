@@ -11,8 +11,8 @@ GUI-инструмент лабораторной: восстановление 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
-import random
 import shutil
 import string
 import subprocess
@@ -91,15 +91,24 @@ ALPHABETS = {
 }
 
 # -------------- hashcat helpers ----------------------
+DEFAULT_HASHCAT_PATH = r"C:\\Program Files\\hashcat-7.1.2"
+
+
 def ensure_hashcat(path: str) -> str:
     p = Path(path)
     if p.exists():
-        return str(p.resolve())
+        if p.is_dir():
+            candidates = [p / "hashcat.exe", p / "hashcat"]
+            for cand in candidates:
+                if cand.exists():
+                    return str(cand.resolve())
+        else:
+            return str(p.resolve())
     resolved = shutil.which(path)
     if resolved is None:
         raise FileNotFoundError(
             f"Не найден '{path}'. Установите hashcat и добавьте в PATH, "
-            f"или укажите полный путь в поле 'Hashcat path'."
+            f"или укажите полный путь к hashcat."
         )
     return resolved
 
@@ -183,10 +192,10 @@ class KnownPair:
     hash_value: str
     phone: str
 
-def load_known_pairs(rows: Iterable[Dict[str, str]], limit: int) -> List[KnownPair]:
+def load_known_pairs(rows: Iterable[Dict[str, str]], limit: Optional[int]) -> List[KnownPair]:
     known: List[KnownPair] = []
     for r in rows:
-        if len(known) >= limit:
+        if limit is not None and len(known) >= limit:
             break
         h = r.get("A")
         p = r.get("C")
@@ -227,7 +236,106 @@ def max_col_in_rows(rows: List[Dict[str,str]]) -> int:
                 pass
     return m
 
+
+def count_known_pairs_in_column(rows: List[Dict[str, str]], column: str = "C") -> int:
+    count = 0
+    started = False
+    for r in rows:
+        val = r.get(column)
+        if val:
+            count += 1
+            started = True
+        elif started:
+            break
+    return count
+
+
+def _hash_function(name: str):
+    mapping = {
+        "MD5": hashlib.md5,
+        "SHA1": hashlib.sha1,
+        "SHA256": hashlib.sha256,
+        "SHA512": hashlib.sha512,
+    }
+    return mapping[name]
+
+
+def _max_auto_length(alphabet_size: int, limit: int = 1_000_000) -> int:
+    if alphabet_size <= 1:
+        return 8
+
+    length = 0
+    combos = 1
+    while combos <= limit:
+        length += 1
+        combos *= alphabet_size
+        if combos > limit:
+            return length - 1
+    return length
+
+
+def _detect_salt_length_for_pair(pair: KnownPair, *, hash_name: str, pattern: str,
+                                 alphabet: Sequence[str], max_length: int) -> Optional[int]:
+    hfunc = _hash_function(hash_name)
+    phone = pair.phone
+    target = pair.hash_value.lower()
+
+    if pattern == "phone":
+        digest = hfunc(phone.encode("utf-8")).hexdigest()
+        return 0 if digest == target else None
+
+    for length in range(0, max_length + 1):
+        for salt_tuple in itertools.product(alphabet, repeat=length):
+            salt = "".join(salt_tuple)
+            if pattern == "salt+phone":
+                data = (salt + phone).encode("utf-8")
+            else:  # phone+salt
+                data = (phone + salt).encode("utf-8")
+            digest = hfunc(data).hexdigest()
+            if digest == target:
+                return length
+    return None
+
+
+def detect_salt_length_range(known: Sequence[KnownPair], *, hash_name: str,
+                             pattern: str, alphabet: Sequence[str]) -> Tuple[int, int]:
+    if pattern == "phone":
+        return 0, 0
+    if not known:
+        raise ValueError("Нет известных пар для определения длины соли")
+
+    max_length = _max_auto_length(len(alphabet))
+    if max_length == 0:
+        raise ValueError("Слишком большой алфавит для автоматического перебора длины соли")
+
+    first_pair = known[0]
+    length = _detect_salt_length_for_pair(
+        first_pair,
+        hash_name=hash_name,
+        pattern=pattern,
+        alphabet=alphabet,
+        max_length=max_length,
+    )
+    if length is None:
+        raise ValueError("Не удалось определить длину соли по известной паре")
+
+    return length, length
+
+
+def hash_phone_value(phone: str, *, salt: str, pattern: str, hash_name: str) -> str:
+    hfunc = _hash_function(hash_name)
+    if pattern == "salt+phone":
+        data = salt + phone
+    elif pattern == "phone+salt":
+        data = phone + salt
+    else:
+        data = phone
+    return hfunc(data.encode("utf-8")).hexdigest()
+
 # -------------- GUI -----------------------
+DEFAULT_PHONE_MASK = "8?d?d?d?d?d?d?d?d?d?d"
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -242,12 +350,6 @@ class App:
         ttk.Entry(row, textvariable=self.file_var, width=70).pack(side="left", padx=6)
         ttk.Button(row, text="Обзор…", command=self.browse).pack(side="left")
 
-        # Hashcat path
-        row = ttk.Frame(frm); row.pack(fill="x", pady=6)
-        ttk.Label(row, text="Hashcat path:").pack(side="left")
-        self.hc_var = tk.StringVar(value="hashcat")  # можно указать полный путь к hashcat.exe
-        ttk.Entry(row, textvariable=self.hc_var, width=50).pack(side="left", padx=6)
-
         # Algorithm / pattern / mask
         row = ttk.Frame(frm); row.pack(fill="x", pady=6)
         ttk.Label(row, text="Алгоритм:").pack(side="left")
@@ -258,9 +360,6 @@ class App:
         self.pattern_var = tk.StringVar(value="salt+phone")
         ttk.Combobox(row, textvariable=self.pattern_var,
                      values=["salt+phone","phone+salt","phone"], state="readonly", width=12).pack(side="left", padx=6)
-        ttk.Label(row, text="Маска телефона:").pack(side="left", padx=(12,0))
-        self.mask_var = tk.StringVar(value="8?d?d?d?d?d?d?d?d?d?d")
-        ttk.Entry(row, textvariable=self.mask_var, width=28).pack(side="left", padx=6)
 
         # Salt config
         row = ttk.Frame(frm); row.pack(fill="x", pady=6)
@@ -268,24 +367,11 @@ class App:
         self.salt_type_var = tk.StringVar(value="numeric")
         ttk.Combobox(row, textvariable=self.salt_type_var,
                      values=["numeric","alpha","mixed"], state="readonly", width=10).pack(side="left", padx=6)
-        ttk.Label(row, text="Длина соли (min-max):").pack(side="left", padx=(12,0))
-        self.salt_min = tk.IntVar(value=1)
-        self.salt_max = tk.IntVar(value=4)
-        ttk.Spinbox(row, from_=0, to=8, textvariable=self.salt_min, width=4).pack(side="left", padx=3)
-        ttk.Spinbox(row, from_=0, to=8, textvariable=self.salt_max, width=4).pack(side="left", padx=3)
-        ttk.Label(row, text="Кол-во известных пар (валидация):").pack(side="left", padx=(12,0))
-        self.known_n = tk.IntVar(value=5)
-        ttk.Spinbox(row, from_=1, to=50, textvariable=self.known_n, width=5).pack(side="left", padx=3)
-
-        # Extra args
-        row = ttk.Frame(frm); row.pack(fill="x", pady=6)
-        ttk.Label(row, text="Доп. аргументы hashcat (необязательно):").pack(side="left")
-        self.extra_args = tk.StringVar(value="--force")
-        ttk.Entry(row, textvariable=self.extra_args, width=50).pack(side="left", padx=6)
 
         # Buttons
         row = ttk.Frame(frm); row.pack(fill="x", pady=10)
         ttk.Button(row, text="Восстановить телефоны (hashcat)", command=self.run_crack).pack(side="left", padx=6)
+        ttk.Button(row, text="Зашифровать телефоны", command=self.run_encrypt).pack(side="left", padx=6)
         ttk.Button(row, text="Выход", command=root.destroy).pack(side="right", padx=6)
 
         # Log
@@ -319,21 +405,20 @@ class App:
         m = HASH_NAME_TO_M[alg]
         pattern = self.pattern_var.get()
         a_mode = PATTERN_TO_ATTACK_MODE[pattern]
-        mask = self.mask_var.get().strip() or "8?d?d?d?d?d?d?d?d?d?d"
         salt_type = self.salt_type_var.get()
-        min_len, max_len = int(self.salt_min.get()), int(self.salt_max.get())
-        if max_len < min_len:
-            messagebox.showerror("Ошибка", "Длина соли: max < min")
-            return
 
         # выбрать путь к hashcat
         try:
-            hashcat_path = ensure_hashcat(self.hc_var.get().strip() or "hashcat")
+            try:
+                hashcat_path = ensure_hashcat(DEFAULT_HASHCAT_PATH)
+            except FileNotFoundError:
+                hashcat_path = ensure_hashcat("hashcat")
         except Exception as e:
             messagebox.showerror("Hashcat", str(e)); return
 
         # подготовка данных
-        known = load_known_pairs(rows, self.known_n.get())
+        known_limit = count_known_pairs_in_column(rows)
+        known = load_known_pairs(rows, known_limit if known_limit else None)
         if not known:
             messagebox.showerror("Ошибка", "Не удалось найти известные пары (колонка C должна содержать телефоны хотя бы в нескольких строках).")
             return
@@ -346,6 +431,11 @@ class App:
         salts: List[str] = []
         if pattern != "phone":
             alphabet = ALPHABETS[salt_type]
+            try:
+                min_len, max_len = detect_salt_length_range(known, hash_name=alg, pattern=pattern, alphabet=alphabet)
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Не удалось определить длину соли автоматически: {e}")
+                return
             space = SaltSearchSpace(f"{salt_type}({min_len}-{max_len})", alphabet, min_len, max_len)
             # ВНИМАНИЕ: количество комбинаций растёт экспоненциально.
             # Для лабораторных типичные min/max малы (1-4).
@@ -356,6 +446,8 @@ class App:
                 return
 
         self.log_print(f"Найдено известных пар: {len(known)}; всего хэшей: {len(all_hashes)}; солей: {len(salts)}")
+        if pattern != "phone":
+            self.log_print(f"Длины соли (авто): {min_len}-{max_len}")
         out_csv = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")], title="Сохранить результат как")
         if not out_csv:
             return
@@ -372,8 +464,6 @@ class App:
             if pattern != "phone":
                 write_lines(salts_file, salts)
 
-            extra = self.extra_args.get().strip().split() if self.extra_args.get().strip() else []
-
             # 1) Валидация на известных парах
             self.log_print(f"Валидация на известных парах: m={m}, a={a_mode}, pattern={pattern}")
             code, cracked_known, proc = run_hashcat(
@@ -381,9 +471,9 @@ class App:
                 hash_type=m,
                 attack_mode=a_mode,
                 hash_file=known_hashes,
-                mask=mask,
+                mask=DEFAULT_PHONE_MASK,
                 salts_file=salts_file if pattern!="phone" else None,
-                extra_args=extra,
+                extra_args=(),
             )
             # показать вывод
             if proc.stdout: self.log_print(proc.stdout)
@@ -403,9 +493,9 @@ class App:
                 hash_type=m,
                 attack_mode=a_mode,
                 hash_file=all_hashes_file,
-                mask=mask,
+                mask=DEFAULT_PHONE_MASK,
                 salts_file=salts_file if pattern!="phone" else None,
-                extra_args=extra,
+                extra_args=(),
             )
             if proc2.stdout: self.log_print(proc2.stdout)
             if proc2.stderr: self.log_print(proc2.stderr)
@@ -440,6 +530,68 @@ class App:
 
         self.log_print(f"Готово. Восстановлено {recovered_count} из {len(all_hashes)}. Результат: {out_csv}")
         messagebox.showinfo("Готово", f"Восстановлено {recovered_count} из {len(all_hashes)} телефонов.\nФайл: {out_csv}")
+
+    def run_encrypt(self):
+        xlsx = self.file_var.get().strip()
+        if not xlsx:
+            messagebox.showerror("Ошибка", "Выберите XLSX файл.")
+            return
+        try:
+            rows = list(iter_rows(Path(xlsx)))
+        except Exception as e:
+            messagebox.showerror("Ошибка чтения XLSX", str(e))
+            return
+        if not rows:
+            messagebox.showerror("Ошибка", "В книге не найдено строк.")
+            return
+
+        alg = self.alg_var.get()
+        pattern = self.pattern_var.get()
+
+        out_csv = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")], title="Сохранить результат как")
+        if not out_csv:
+            return
+
+        phones_present = any(r.get("C") for r in rows)
+        if not phones_present:
+            messagebox.showerror("Ошибка", "В колонке C нет телефонов для шифрования.")
+            return
+
+        if pattern != "phone":
+            missing_salt = any(r.get("C") and not r.get("B") for r in rows)
+            if missing_salt:
+                messagebox.showerror("Ошибка", "Для шифрования с солью необходимо указать соль в колонке B для каждой строки с телефоном.")
+                return
+
+        max_col = max_col_in_rows(rows)
+        headers = [index_to_letters(i) for i in range(1, max_col+1)]
+        headers = [("A_HASHED" if h == "A" else h) for h in headers]
+
+        hashed_count = 0
+        import csv
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for r in rows:
+                phone = r.get("C")
+                salt = r.get("B", "")
+                hashed_value = r.get("A", "")
+                if phone:
+                    if pattern == "phone":
+                        salt = ""
+                    hashed_value = hash_phone_value(phone, salt=salt, pattern=pattern, hash_name=alg)
+                    hashed_count += 1
+                row_out: List[str] = []
+                for i in range(1, max_col+1):
+                    col = index_to_letters(i)
+                    if col == "A":
+                        row_out.append(hashed_value if phone else r.get(col, ""))
+                    else:
+                        row_out.append(r.get(col, ""))
+                w.writerow(row_out)
+
+        self.log_print(f"Файл зашифрован. Строк обработано: {hashed_count}. Результат: {out_csv}")
+        messagebox.showinfo("Готово", f"Создан файл с хэшами. Строк обработано: {hashed_count}.\nФайл: {out_csv}")
 
 # -------------- entrypoints -----------------
 def run_gui() -> int:
