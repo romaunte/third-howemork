@@ -1,41 +1,46 @@
-# Hash Cracking Attempt for Variant 5
+# Hashcat Workflow for Variant 5
 
-This repository contains the raw dataset (`Data/data_вар. 5.xlsx`) and a
-Python script (`scripts/crack_phone_hashes.py`) that automates several brute
-force experiments over common hash algorithms and salt-placement patterns.
-Because third-party dependencies are unavailable in the execution environment,
-the script includes a minimal XLSX parser and uses the standard `hashlib`
-implementations exclusively.
+This repository now ships a helper script, `scripts/crack_phone_hashes.py`, that
+prepares the provided dataset (`Data/data_вар. 5.xlsx`) for use with
+[hashcat](https://hashcat.net/hashcat/) and automates the typical cracking
+workflow.
 
 ## What the script does
 
-* reads the workbook manually via `zipfile` and `xml.etree.ElementTree`;
-* extracts the known `(hash, phone)` pairs from column `C` (five numbers are
-  provided in the dataset);
-* iterates through combinations of:
-  * hash algorithms: `md5`, `sha1`, `sha256`, `blake2s` (16-byte digest);
-  * salt placement patterns: `salt + phone`, `phone + salt`, and
-    `salt + phone + salt`;
-  * salt alphabets/ranges (`digits`, `lowercase`, alphanumeric, small set of
-    printable characters) with lengths up to four characters.
-* If a combination matches all known pairs the tool would decode the full
-  dataset; otherwise it reports the number of candidates tested for each
-  combination and suggests expanding the search space.
+* parses the XLSX file without external dependencies to extract the hashed
+  values (column **A**) and the five known phone numbers (column **C**);
+* generates temporary hash lists for the calibration set and the full dataset;
+* optionally enumerates candidate salts from configurable search spaces;
+* invokes `hashcat` with a user-specified hash type, mask, and salt pattern;
+* validates that the selected parameters successfully recover every known
+  plaintext sample before attacking the full dataset;
+* writes a `hash -> phone` mapping for every recovered entry.
 
-## Current result
+## Example usage
 
-Running the script against the provided dataset did not locate a matching
-combination inside the default search space. Below is an excerpt from the run
-(see the console logs for the complete output):
-
-```
-Loaded 5 known pairs for calibration.
-Tried 11,110 candidates for md5 / salt+phone within digits (1-4) without success.
-...
-Tried 4,422 candidates for blake2s16 / salt+phone+salt within printable (1-2) without success.
-No combination found in the current search space.
+```bash
+# Attempt an MD5 + salt-prefix crack using numeric salts up to four characters.
+python3 scripts/crack_phone_hashes.py Data/'data_вар. 5.xlsx' \
+  --hash-type 0 \
+  --pattern salt+phone \
+  --salt-space digits1-4 \
+  --mask 8?d?d?d?d?d?d?d?d?d?d \
+  --extra-arg --force
 ```
 
-The code is structured so that new hash algorithms, patterns, or extended salt
-spaces can be added quickly if more information about the hashing scheme
-becomes available.
+Adjust `--hash-type` to the desired hashcat mode (e.g., `100` for SHA1,
+`1400` for SHA256), expand `--salt-space` as needed, and swap the pattern to
+`phone+salt` or `phone` for other arrangements.
+
+## Notes
+
+* Hashcat is not bundled with this repository. Install it separately and ensure
+  the `hashcat` binary is reachable via `$PATH` or point the script at a custom
+  location with `--hashcat /path/to/hashcat`.
+* If the environment lacks GPU support, pass `--extra-arg --opencl-device-types 1`
+  (CPU only) or any other options suitable for your setup.
+* The script exits early when the known calibration samples are not recovered,
+  preventing time-consuming attacks with incorrect parameters.
+* Expand the salt search space or adjust the mask to evaluate how salt length,
+  salt alphabet, and hash type impact cracking performance, as required by the
+  lab assignment.
